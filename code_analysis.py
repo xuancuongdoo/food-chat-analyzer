@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 """
-code_analysis.py — Senior engineer code quality report for past week's commits.
+code_analysis.py -- Senior engineer code quality report for recent commits.
 
-Metrics:
-  - Churn vs complexity (files changed often + large diffs)
-  - Test coverage signal (test file changes vs src changes)
-  - PR size discipline (lines per commit)
-  - Dead code signal (deleted lines ratio, TODO/FIXME drift)
-  - SOC layer mixing (commit touches multiple architectural layers)
-  - SOC function-level (LLM analysis on flagged commits only)
-  - Time estimation (session-based heuristic)
-
-Output: terminal report + LLM senior engineer verdict (short, sharp).
+Usage:
+  python3 code_analysis.py                           # current dir, 7 days, all authors
+  python3 code_analysis.py --repo /path/to/repo
+  python3 code_analysis.py --author you@email.com
+  python3 code_analysis.py --days 14
+  python3 code_analysis.py --model gpt-4o
 """
 
+import argparse
 import os
 import re
 import subprocess
@@ -23,13 +20,6 @@ from dataclasses import dataclass, field
 from typing import Optional
 from openai import OpenAI
 
-# ── Config ────────────────────────────────────────────────────────────────────
-REPO   = "/Users/xuancuong/Documents/work/sippify"
-AUTHOR = "64152374+xuancuongdoo@users.noreply.github.com"
-DAYS   = 7
-MODEL  = "gpt-4o"
-
-# Architectural layers — map path prefix → layer name
 LAYER_MAP = {
     "app/":           "routes",
     "components/":    "ui",
@@ -41,14 +31,36 @@ LAYER_MAP = {
     "design-system/": "ui",
 }
 
-# Session gap: >= 2h between commits = new session; add 15min ramp-up
 SESSION_GAP_SECONDS  = 2 * 3600
 SESSION_RAMP_MINUTES = 15
 MAX_SESSION_HOURS    = 4
-# ──────────────────────────────────────────────────────────────────────────────
+DEFAULT_MODEL        = "gpt-4o-mini"
 
 
-def run(cmd: str, cwd: str = REPO) -> str:
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Analyze git commit quality for the past N days.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python3 code_analysis.py
+  python3 code_analysis.py --repo ~/projects/myapp --days 14
+  python3 code_analysis.py --author alice@example.com
+  python3 code_analysis.py --model gpt-4o
+        """,
+    )
+    parser.add_argument("--repo",   default=None, help="Git repo path (default: cwd)")
+    parser.add_argument("--author", default=None, help="Filter by author email/name")
+    parser.add_argument("--days",   type=int, default=7, help="Days to look back (default: 7)")
+    parser.add_argument("--model",  default=DEFAULT_MODEL, help=f"OpenAI model (default: {DEFAULT_MODEL})")
+    return parser.parse_args()
+
+
+def resolve_repo(path: Optional[str]) -> str:
+    return os.path.expanduser(path) if path else os.getcwd()
+
+
+def run(cmd: str, cwd: str) -> str:
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=cwd)
     return result.stdout.strip()
 
@@ -69,27 +81,30 @@ class CommitInfo:
     soc_mixed: bool = False
 
 
-def get_commits():
+def get_commits(repo: str, author: Optional[str], days: int):
+    author_flag = f'--author="{author}"' if author else ""
     log = run(
-        f'git log --since="{DAYS} days ago" --author="{AUTHOR}" '
-        f'--format="%H|%at|%s" --no-merges'
+        f'git log --since="{days} days ago" {author_flag} --format="%H|%at|%s" --no-merges',
+        cwd=repo,
     )
     if not log:
         return []
-
     commits = []
     for line in log.splitlines():
-        sha, ts, subject = line.split("|", 2)
+        parts = line.split("|", 2)
+        if len(parts) != 3:
+            continue
+        sha, ts, subject = parts
         commits.append(CommitInfo(sha=sha, timestamp=int(ts), subject=subject))
     return commits
 
 
-def enrich_commits(commits):
+def enrich_commits(commits, repo: str):
     for c in commits:
-        stat = run(f"git show --stat --format='' {c.sha}")
+        stat = run(f"git show --stat --format='' {c.sha}", cwd=repo)
         c.insertions, c.deletions = parse_stat_summary(stat)
         c.files_changed = parse_changed_files(
-            run(f"git diff-tree --no-commit-id -r --name-only {c.sha}")
+            run(f"git diff-tree --no-commit-id -r --name-only {c.sha}", cwd=repo)
         )
 
         layers = set()
@@ -104,25 +119,23 @@ def enrich_commits(commits):
         c.soc_mixed = len(code_layers) >= 3
 
         test_files = [f for f in c.files_changed if "test" in f.lower() or f.startswith("tests/")]
-        c.has_test_files = len(test_files) > 0
-        c.is_test_only = len(test_files) == len(c.files_changed) and len(c.files_changed) > 0
+        c.has_test_files = bool(test_files)
+        c.is_test_only = len(test_files) == len(c.files_changed) and bool(c.files_changed)
 
         if c.deletions > 0 and c.insertions < c.deletions * 0.3 and not c.has_test_files:
             c.dead_code_signal = True
 
-        diff = run(f"git show {c.sha} -- '*.ts' '*.tsx' '*.js'")
-        added_todos   = len(re.findall(r'^\+.*\b(TODO|FIXME|HACK|XXX)\b', diff, re.MULTILINE))
-        removed_todos = len(re.findall(r'^-.*\b(TODO|FIXME|HACK|XXX)\b', diff, re.MULTILINE))
-        c.todo_drift = added_todos - removed_todos
-
+        diff = run(f"git show {c.sha} -- '*.ts' '*.tsx' '*.js' '*.py'", cwd=repo)
+        c.todo_drift = (
+            len(re.findall(r'^\+.*(TODO|FIXME|HACK|XXX)', diff, re.MULTILINE))
+            - len(re.findall(r'^-.*(TODO|FIXME|HACK|XXX)', diff, re.MULTILINE))
+        )
     return commits
 
 
 def parse_stat_summary(stat):
-    m = re.search(r'(\d+) insertion', stat)
-    ins = int(m.group(1)) if m else 0
-    m = re.search(r'(\d+) deletion', stat)
-    dels = int(m.group(1)) if m else 0
+    ins  = int(m.group(1)) if (m := re.search(r"(\d+) insertion", stat)) else 0
+    dels = int(m.group(1)) if (m := re.search(r"(\d+) deletion", stat)) else 0
     return ins, dels
 
 
@@ -134,25 +147,18 @@ def estimate_hours(commits):
     if not commits:
         return 0.0
     timestamps = sorted(c.timestamp for c in commits)
-    total_minutes = 0
-    session_start = timestamps[0]
-    prev = timestamps[0]
-
+    total_minutes, session_start, prev = 0, timestamps[0], timestamps[0]
     for ts in timestamps[1:]:
-        gap = ts - prev
-        if gap >= SESSION_GAP_SECONDS:
-            session_minutes = (prev - session_start) / 60 + SESSION_RAMP_MINUTES
-            total_minutes += min(session_minutes, MAX_SESSION_HOURS * 60)
+        if ts - prev >= SESSION_GAP_SECONDS:
+            total_minutes += min((prev - session_start) / 60 + SESSION_RAMP_MINUTES, MAX_SESSION_HOURS * 60)
             session_start = ts
         prev = ts
-
-    session_minutes = (prev - session_start) / 60 + SESSION_RAMP_MINUTES
-    total_minutes += min(session_minutes, MAX_SESSION_HOURS * 60)
+    total_minutes += min((prev - session_start) / 60 + SESSION_RAMP_MINUTES, MAX_SESSION_HOURS * 60)
     return round(total_minutes / 60, 1)
 
 
 def compute_churn(commits):
-    file_changes = defaultdict(int)
+    file_changes: dict = defaultdict(int)
     for c in commits:
         for f in c.files_changed:
             file_changes[f] += 1
@@ -163,114 +169,82 @@ def pick_soc_candidates(commits):
     return [c for c in commits if c.soc_mixed or (c.insertions + c.deletions) > 300]
 
 
-def build_llm_payload(commits, soc_candidates, churn, hours):
-    commit_summaries = []
-    for c in commits:
-        commit_summaries.append({
-            "subject":       c.subject,
-            "insertions":    c.insertions,
-            "deletions":     c.deletions,
-            "files_changed": len(c.files_changed),
-            "layers_touched": sorted(c.layers),
-            "has_tests":     c.has_test_files,
-            "soc_mixed":     c.soc_mixed,
-            "todo_drift":    c.todo_drift,
-            "dead_code_signal": c.dead_code_signal,
-        })
-
-    soc_details = []
-    for c in soc_candidates:
-        soc_details.append({
-            "subject":    c.subject,
-            "layers":     sorted(c.layers),
-            "insertions": c.insertions,
-            "deletions":  c.deletions,
-            "files":      len(c.files_changed),
-        })
-
-    total_ins    = sum(c.insertions for c in commits)
-    total_dels   = sum(c.deletions for c in commits)
-    test_ratio   = sum(1 for c in commits if c.has_test_files) / len(commits) if commits else 0
-    avg_size     = (total_ins + total_dels) / len(commits) if commits else 0
-    todo_drift   = sum(c.todo_drift for c in commits)
-    dead_signals = sum(1 for c in commits if c.dead_code_signal)
-    soc_viols    = sum(1 for c in commits if c.soc_mixed)
+def build_llm_payload(commits, soc_candidates, churn, hours, days):
+    total_ins  = sum(c.insertions for c in commits)
+    total_dels = sum(c.deletions for c in commits)
+    test_ratio = sum(1 for c in commits if c.has_test_files) / len(commits) if commits else 0
 
     return {
-        "period_days":          DAYS,
-        "total_commits":        len(commits),
-        "estimated_hours":      hours,
-        "avg_commit_size_lines": round(avg_size),
-        "total_insertions":     total_ins,
-        "total_deletions":      total_dels,
-        "test_coverage_signal": round(test_ratio * 100),
-        "todo_drift_net":       todo_drift,
-        "dead_code_signals":    dead_signals,
-        "soc_violations":       soc_viols,
-        "top_churned_files":    list(churn.keys())[:5],
-        "commits":              commit_summaries,
-        "soc_flagged_commits":  soc_details,
+        "period_days":           days,
+        "total_commits":         len(commits),
+        "estimated_hours":       hours,
+        "avg_commit_size_lines": round((total_ins + total_dels) / len(commits)) if commits else 0,
+        "total_insertions":      total_ins,
+        "total_deletions":       total_dels,
+        "test_coverage_signal":  round(test_ratio * 100),
+        "todo_drift_net":        sum(c.todo_drift for c in commits),
+        "dead_code_signals":     sum(1 for c in commits if c.dead_code_signal),
+        "soc_violations":        sum(1 for c in commits if c.soc_mixed),
+        "top_churned_files":     list(churn.keys())[:5],
+        "commits": [
+            {
+                "subject":        c.subject,
+                "insertions":     c.insertions,
+                "deletions":      c.deletions,
+                "files_changed":  len(c.files_changed),
+                "layers_touched": sorted(c.layers),
+                "has_tests":      c.has_test_files,
+                "soc_mixed":      c.soc_mixed,
+                "todo_drift":     c.todo_drift,
+                "dead_code_signal": c.dead_code_signal,
+            }
+            for c in commits
+        ],
+        "soc_flagged_commits": [
+            {
+                "subject":    c.subject,
+                "layers":     sorted(c.layers),
+                "insertions": c.insertions,
+                "deletions":  c.deletions,
+                "files":      len(c.files_changed),
+            }
+            for c in soc_candidates
+        ],
     }
 
 
-SYSTEM_PROMPT = """You are a senior software engineer with 15+ years of experience.
-You value code quality above delivery speed. You are reviewing a week of commit metrics
-for a single developer. Be ruthlessly honest but constructive.
-
-Your verdict must be SHORT and SHARP:
-1. **Overall Grade** (A/B/C/D) with one-line rationale
-2. **Top 3 Risks** — what will bite this engineer in 30 days if not fixed
-3. **One thing done well** — genuine praise only if earned
-4. **Blunt recommendation** — one concrete action to take this week
-
-Format: plain text, no fluff, no bullet padding. Speak directly to the engineer.
-Max 250 words."""
-
-USER_PROMPT_TEMPLATE = """Here are the commit metrics for the past {period_days} days:
-
-SUMMARY:
-- Commits: {total_commits}
-- Estimated coding hours: {estimated_hours}h
-- Avg commit size: {avg_commit_size_lines} lines
-- Insertions: {total_insertions} | Deletions: {total_deletions}
-- Commits with test files: {test_coverage_signal}%
-- Net TODO/FIXME drift: {todo_drift_net} (positive = accumulating debt)
-- Dead code removal signals: {dead_code_signals} commits (deletion-heavy, no tests)
-- SOC violations (3+ layers in one commit): {soc_violations}
-- Top churned files: {top_churned_files}
-
-INDIVIDUAL COMMITS:
-{commits_json}
-
-SOC-FLAGGED COMMITS (mixed layers or large):
-{soc_json}
-
-Give your verdict."""
+SYSTEM_PROMPT = (
+    "You are a senior software engineer with 15+ years of experience. "
+    "You value code quality above delivery speed. You are reviewing recent commit metrics "
+    "for a developer. Be ruthlessly honest but constructive.\n\n"
+    "Your verdict must be SHORT and SHARP:\n"
+    "1. **Overall Grade** (A/B/C/D) with one-line rationale\n"
+    "2. **Top 3 Risks** -- what will bite this engineer in 30 days if not fixed\n"
+    "3. **One thing done well** -- genuine praise only if earned\n"
+    "4. **Blunt recommendation** -- one concrete action to take this week\n\n"
+    "Format: plain text, no fluff. Speak directly to the engineer. Max 250 words."
+)
 
 
-def call_llm(payload):
+def call_llm(payload, model: str) -> str:
     client = OpenAI()
-    commits_json = json.dumps(payload["commits"], indent=2)
-    soc_json     = json.dumps(payload["soc_flagged_commits"], indent=2)
-
-    user_msg = USER_PROMPT_TEMPLATE.format(
-        period_days           = payload["period_days"],
-        total_commits         = payload["total_commits"],
-        estimated_hours       = payload["estimated_hours"],
-        avg_commit_size_lines = payload["avg_commit_size_lines"],
-        total_insertions      = payload["total_insertions"],
-        total_deletions       = payload["total_deletions"],
-        test_coverage_signal  = payload["test_coverage_signal"],
-        todo_drift_net        = payload["todo_drift_net"],
-        dead_code_signals     = payload["dead_code_signals"],
-        soc_violations        = payload["soc_violations"],
-        top_churned_files     = payload["top_churned_files"],
-        commits_json          = commits_json,
-        soc_json              = soc_json,
+    user_msg = (
+        f"Commit metrics for the past {payload['period_days']} days:\n\n"
+        f"Commits: {payload['total_commits']}  |  "
+        f"Hours: ~{payload['estimated_hours']}h  |  "
+        f"Avg size: {payload['avg_commit_size_lines']} lines\n"
+        f"Ins: {payload['total_insertions']}  Del: {payload['total_deletions']}\n"
+        f"Test signal: {payload['test_coverage_signal']}%  |  "
+        f"TODO drift: {payload['todo_drift_net']}  |  "
+        f"Dead code: {payload['dead_code_signals']}  |  "
+        f"SOC viols: {payload['soc_violations']}\n"
+        f"Top churned: {payload['top_churned_files']}\n\n"
+        f"COMMITS:\n{json.dumps(payload['commits'], indent=2)}\n\n"
+        f"SOC-FLAGGED:\n{json.dumps(payload['soc_flagged_commits'], indent=2)}\n\n"
+        "Give your verdict."
     )
-
     response = client.chat.completions.create(
-        model=MODEL,
+        model=model,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": user_msg},
@@ -281,52 +255,62 @@ def call_llm(payload):
     return response.choices[0].message.content.strip()
 
 
-def print_table(commits, hours, churn):
+def print_table(commits, hours, churn, repo: str):
+    name = os.path.basename(os.path.abspath(repo)).upper()
     print("\n" + "=" * 70)
-    print(f"  SIPPIFY — WEEK IN CODE  |  {len(commits)} commits  |  ~{hours}h estimated")
+    print(f"  {name} -- WEEK IN CODE  |  {len(commits)} commits  |  ~{hours}h estimated")
     print("=" * 70)
-
     print(f"\n{'SHA':8}  {'INS':>5}  {'DEL':>5}  {'LAYERS':<28}  FLAGS")
     print("-" * 70)
     for c in commits:
         flags = []
-        if c.soc_mixed:           flags.append("SOC!")
-        if not c.has_test_files:  flags.append("no-test")
-        if c.todo_drift > 0:      flags.append(f"TODO+{c.todo_drift}")
-        if c.dead_code_signal:    flags.append("dead?")
-        layer_str = ",".join(sorted(c.layers)) if c.layers else "—"
-        flag_str  = " ".join(flags) if flags else "ok"
-        print(f"{c.sha[:7]}  {c.insertions:>5}  {c.deletions:>5}  {layer_str:<28}  {flag_str}")
+        if c.soc_mixed:          flags.append("SOC!")
+        if not c.has_test_files: flags.append("no-test")
+        if c.todo_drift > 0:     flags.append(f"TODO+{c.todo_drift}")
+        if c.dead_code_signal:   flags.append("dead?")
+        layer_str = ",".join(sorted(c.layers)) or "--"
+        print(f"{c.sha[:7]}  {c.insertions:>5}  {c.deletions:>5}  {layer_str:<28}  {' '.join(flags) or 'ok'}")
         print(f"         {c.subject[:62]}")
-
     if churn:
-        print(f"\nTOP CHURNED FILES")
+        print("\nTOP CHURNED FILES")
         print("-" * 50)
         for f, n in list(churn.items())[:5]:
-            bar = "#" * min(n, 20)
-            print(f"  {f[-45:]:<45}  {bar} ({n})")
-
+            print(f"  {f[-45:]:<45}  {'#' * min(n, 20)} ({n})")
     print()
 
 
 def main():
+    args   = parse_args()
+    repo   = resolve_repo(args.repo)
+
+    if not os.path.isdir(os.path.join(repo, ".git")):
+        print(f"Error: {repo!r} is not a git repository.")
+        raise SystemExit(1)
+
+    if not os.environ.get("OPENAI_API_KEY"):
+        print("Error: OPENAI_API_KEY environment variable is not set.")
+        raise SystemExit(1)
+
+    print(f"Repo  : {repo}")
+    print(f"Window: {args.days} days" + (f"  |  Author: {args.author}" if args.author else ""))
     print("Collecting commits...")
-    commits = get_commits()
+
+    commits = get_commits(repo, args.author, args.days)
     if not commits:
-        print(f"No commits found in past {DAYS} days for {AUTHOR}")
+        print(f"No commits found in past {args.days} days.")
         return
 
     print(f"Found {len(commits)} commits. Enriching...")
-    commits = enrich_commits(commits)
-    hours   = estimate_hours(commits)
-    churn   = compute_churn(commits)
+    commits        = enrich_commits(commits, repo)
+    hours          = estimate_hours(commits)
+    churn          = compute_churn(commits)
     soc_candidates = pick_soc_candidates(commits)
 
-    print_table(commits, hours, churn)
+    print_table(commits, hours, churn, repo)
 
-    print("Sending to LLM for senior engineer verdict...\n")
-    payload = build_llm_payload(commits, soc_candidates, churn, hours)
-    verdict = call_llm(payload)
+    print(f"Sending to LLM ({args.model}) for verdict...\n")
+    payload = build_llm_payload(commits, soc_candidates, churn, hours, args.days)
+    verdict = call_llm(payload, args.model)
 
     print("=" * 70)
     print("  SENIOR ENGINEER VERDICT")
